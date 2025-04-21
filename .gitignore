@@ -1,0 +1,7 @@
+data
+.env
+**/__pycache__/
+
+src/fastgeco/Fast-GeCo
+src/mossformer2/checkpoints
+src/sepreformer/Sepreformer
