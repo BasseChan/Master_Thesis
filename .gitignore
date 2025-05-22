@@ -5,3 +5,6 @@ data
 src/fastgeco/Fast-GeCo
 src/mossformer2/checkpoints
 src/sepreformer/Sepreformer
+src/espnet
+
+pretrained_models

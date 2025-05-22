@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import copy
 from mossformer2_block import ScaledSinuEmbedding, MossformerBlock_GFSMN, MossformerBlock
-from utils import load_state_dict, decode_one_audio
+from src.mossformer2.mossformer2_utils import load_state_dict, decode_one_audio
 import os
 
 

@@ -49,6 +49,22 @@ def get_MCD(reference_file, estimated_file):
     return mcd_toolbox.calculate_mcd(reference_file, estimated_file)
 
 
+def get_MSS(reference, estimated):
+    S_ref = np.abs(librosa.stft(reference, n_fft=1024, hop_length=512))
+    S_gen = np.abs(librosa.stft(estimated, n_fft=1024, hop_length=512))
+
+    S_max = np.maximum(S_ref, S_gen)
+    return (sum(sum(S_ref)) + sum(sum(S_gen))) / sum(sum(S_max)) - 1
+
+
+def get_SI_MSS(reference, estimated):
+    eps = np.finfo(reference.dtype).eps
+    a = np.dot(estimated.T, reference) / (np.dot(reference.T, reference) + eps)
+    reference = reference * a
+
+    return get_MSS(reference, estimated)
+
+
 def normalize_text(text):
     """ Normalizacja tekstu: małe litery, usunięcie interpunkcji, nadmiarowych spacji """
     text = text.lower()
@@ -80,16 +96,124 @@ def match_size(ref_wav, gen_wav):
     return gen_wav
 
 
-def calculate_metrics(reference_files: list[str], estimated_files: list[str] | dict[list[str]],
-                      mixed_files: list[str], sr: int = 16000, texts: list[str] = None,
-                      metrics: set[Literal["SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD"]] = None,
+def calculate_single_file_metrics(reference_file: str, estimated_file: str | dict[str],
+                      mixed_file: str, sr: int = 16000, text: str = None,
+                      metrics: set[Literal["SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "MSS", "SI-MSS"]] = None,
                       transcription_model = None) -> dict[str, float] | dict[str, dict[str, float]]:
+    """
+    Calculate metrics for one reference and estimated file.
+
+    Args:
+        reference_file (str): Path to the reference audio file.
+        estimated_file (str | dict[str]): Path to the estimated audio file or a dictionary with keys as labels and values as paths.
+        mixed_file (str): Path to the mixed audio file.
+        sr (int): Sample rate for loading audio files.
+        metrics (set[Literal["SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "MSS", "SI-MSS"]], optional): Set of metrics to calculate. Defaults to None, which calculates all metrics.
+        transcription_model: Transcription model for WER, CER, SIM metrics.
+
+    Returns:
+        dict[str, float] | dict[str, dict[str, float]]: Dictionary with metrics as keys and lists of metric values as values. If estimated_files is a dictionary, the keys will be the labels.
+    """
+
+    if metrics is None:
+        metrics = {"SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "WER", "CER", "SIM", "MSS", "SI-MSS"}
+    else:
+        metrics = metrics & {"SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "WER", "CER", "SIM", "MSS", "SI-MSS"}
+
+    ref = librosa.load(reference_file, sr=sr, mono=True)[0]
+    if sr != 16000: ref = librosa.resample(ref, orig_sr=sr, target_sr=16000)
+
+    if "SDRi" in metrics or "SI-SDRi" in metrics:
+        mix = librosa.load(mixed_file, sr=sr, mono=True)[0]
+
+        if sr != 16000: mix = librosa.resample(mix, orig_sr=sr, target_sr=16000)
+
+        if "SDRi" in metrics: sdr_mix = get_SDR(ref, mix)
+        if "SI-SDRi" in metrics: si_sdr_mix = get_SI_SDR(ref, mix)
+
+    if "WER" in metrics or "CER" in metrics or "SIM" in metrics:
+        if transcription_model is None:
+            raise ValueError("Transcription model is required for WER, CER, and SIM metrics.")
+        text = normalize_text(text)
+
+    def _get_metrics(ref_file, est_file, ref, est, metrics):
+        results = {}
+        if "SDR" in metrics or "SDRi" in metrics:
+            sdr = get_SDR(ref, est)
+            if "SDR" in metrics:
+                results["SDR"] = sdr
+            if "SDRi" in metrics:
+                results["SDRi"] = sdr - sdr_mix
+
+        if "SI-SDR" in metrics or "SI-SDRi" in metrics:
+            si_sdr = get_SI_SDR(ref, est)
+            if "SI-SDR" in metrics:
+                results["SI-SDR"] = si_sdr
+            if "SI-SDRi" in metrics:
+                results["SI-SDRi"] = si_sdr - si_sdr_mix
+
+        if "PESQ" in metrics:
+            pesq = get_PESQ(ref, est, 16000)
+            results["PESQ"] = pesq
+
+        if "STOI" in metrics:
+            stoi = get_STOI(ref, est, 16000)
+            results["STOI"] = stoi
+
+        if "MCD" in metrics:
+            mcd = get_MCD(ref_file, est_file)
+            results["MCD"] = mcd
+
+        if {"WER", "CER", "SIM"} & metrics:
+            asr_text = normalize_text(transcription_model.transcribe(est, without_timestamps=True, language='en')['text'].strip())
+            if "WER" in metrics:
+                wer = get_WER(text, asr_text)
+                results["WER"] = wer
+            if "CER" in metrics:
+                cer = get_CER(text, asr_text)
+                results["CER"] = cer
+            if "SIM" in metrics:
+                sim = get_SIM(text, asr_text)
+                results["SIM"] = sim
+        
+        if "MSS" in metrics:
+            mss = get_MSS(ref, est)
+            results["MSS"] = mss
+
+        if "SI-MSS" in metrics:
+            si_mss = get_SI_MSS(ref, est)
+            results["SI-MSS"] = si_mss
+
+        return results
+
+    if isinstance(estimated_file, dict):
+        results = {}
+        for model, est_file in estimated_file.items():
+            est = librosa.load(est_file, sr=sr, mono=True)[0]
+            if sr != 16000: est = librosa.resample(est, orig_sr=sr, target_sr=16000)
+            est = match_size(ref, est)
+
+            results[model] = _get_metrics(reference_file, est_file, ref, est, metrics)
+    else:
+        est = librosa.load(estimated_file, sr=sr, mono=True)[0]
+        if sr != 16000: est = librosa.resample(est, orig_sr=sr, target_sr=16000)
+        est = match_size(ref, est)
+
+        results = _get_metrics(reference_file, estimated_file, ref, est, metrics)
+
+    return results
+
+
+def calculate_metrics(reference_files: list[str], estimated_files: list[str] | list[dict[str]],
+                      mixed_files: list[str], sr: int = 16000, texts: list[str] = None,
+                      metrics: set[Literal["SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "MSS", "SI-MSS"]] = None,
+                      transcription_model = None) -> list[dict[str, float]] | list[dict[str, dict[str, float]]]:
     """
     Calculate metrics for a list of reference and estimated files.
 
     Args:
         reference_files (list[str]): List of reference audio file paths.
-        estimated_files (list[str] | dict[list[str]]): List of estimated audio file paths or a dictionary with keys as labels and values as lists of file paths.
+        estimated_files (list[str] | list[dict[str]]): List of estimated audio file paths or a dictionary with keys as labels and values as lists of file paths.
         mixed_files (list[str]): List of mixed audio file paths.
         sr (int): Sample rate for loading audio files.
 
@@ -98,140 +222,11 @@ def calculate_metrics(reference_files: list[str], estimated_files: list[str] | d
     """
 
     if metrics is None:
-        metrics = {"SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "WER", "CER", "SIM"}
+        metrics = {"SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "WER", "CER", "SIM", "MSS", "SI-MSS"}
     else:
-        metrics = metrics & {"SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "WER", "CER", "SIM"}
+        metrics = metrics & {"SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "WER", "CER", "SIM", "MSS", "SI-MSS"}
 
-    if isinstance(estimated_files, dict):
-        results = {label: {metric: [] for metric in metrics} for label in estimated_files.keys()}
-    else:
-        results = {metric: [] for metric in metrics}
-
-    if "SDRi" in metrics or "SI-SDRi" in metrics:
-        if "SDRi" in metrics:
-            sdr_mix = []
-        if "SI-SDRi" in metrics:
-            si_sdr_mix = []
-        for ref_file, mix_file in tqdm(list(zip(reference_files, mixed_files))):
-            ref = librosa.load(ref_file, sr=sr, mono=True)[0]
-            mix = librosa.load(mix_file, sr=sr, mono=True)[0]
-
-            if sr != 16000:
-                ref = librosa.resample(ref, orig_sr=sr, target_sr=16000)
-                mix = librosa.resample(mix, orig_sr=sr, target_sr=16000)
-
-            if "SDRi" in metrics:
-                sdr_mix.append(get_SDR(ref, mix))
-            if "SI-SDRi" in metrics:
-                si_sdr_mix.append(get_SI_SDR(ref, mix))
-
-    if {"WER", "CER", "SIM"} & metrics:
-        if texts is None:
-            raise ValueError("Texts must be provided for WER, CER, SIM metrics.")
-        texts = [normalize_text(text) for text in texts]
+    results = [calculate_single_file_metrics(ref_file, est_file, mix_file, sr, text, metrics, transcription_model)
+               for ref_file, est_file, mix_file, text in tqdm(list(zip(reference_files, estimated_files, mixed_files, texts)))]
     
-    if isinstance(estimated_files, dict):
-        for i in tqdm(range(len(reference_files))):
-            ref = librosa.load(reference_files[i], sr=sr, mono=True)[0]
-            ref = librosa.resample(ref, orig_sr=sr, target_sr=16000) if sr != 16000 else ref
-
-            for model in estimated_files.keys():
-                est_file = estimated_files[model][i]
-                est_wav = librosa.load(est_file, sr=sr, mono=True)[0]
-                est_wav = librosa.resample(est_wav, orig_sr=sr, target_sr=16000) if sr != 16000 else est_wav
-                est_wav = match_size(ref, est_wav)
-
-                if "SDR" in metrics or "SDRi" in metrics:
-                    sdr = get_SDR(ref, est_wav)
-                    if "SDR" in metrics:
-                        results[model]["SDR"].append(sdr)
-                    if "SDRi" in metrics:
-                        results[model]["SDRi"].append(sdr - sdr_mix[i])
-                
-                if "SI-SDR" in metrics or "SI-SDRi" in metrics:
-                    si_sdr = get_SI_SDR(ref, est_wav)
-                    if "SI-SDR" in metrics:
-                        results[model]["SI-SDR"].append(si_sdr)
-                    if "SI-SDRi" in metrics:
-                        results[model]["SI-SDRi"].append(si_sdr - si_sdr_mix[i])
-
-                if "PESQ" in metrics:
-                    pesq = get_PESQ(ref, est_wav, 16000)
-                    results[model]["PESQ"].append(pesq)
-
-                if "STOI" in metrics:
-                    stoi = get_STOI(ref, est_wav, 16000)
-                    results[model]["STOI"].append(stoi)
-
-                if "MCD" in metrics:
-                    mcd = get_MCD(reference_files[i], estimated_files[model][i])
-                    results[model]["MCD"].append(mcd)
-
-                if {"WER", "CER", "SIM"} & metrics:
-                    asr_text = normalize_text(transcription_model.transcribe(est_wav, without_timestamps=True, language='en')['text'].strip())
-                    if "WER" in metrics:
-                        wer = get_WER(texts[i], asr_text)
-                        results[model]["WER"].append(wer)
-                    if "CER" in metrics:
-                        cer = get_CER(texts[i], asr_text)
-                        results[model]["CER"].append(cer)
-                    if "SIM" in metrics:
-                        sim = get_SIM(texts[i], asr_text)
-                        results[model]["SIM"].append(sim)
-
-                # print(f"Model: {model}, File: {i}, SDR: {results[model]['SDR'][-1]}, SDRi: {results[model]['SDRi'][-1]}, SI-SDR: {results[model]['SI-SDR'][-1]}, SI-SDRi: {results[model]['SI-SDRi'][-1]}")
-                # print(f"PESQ: {results[model]['PESQ'][-1]}, STOI: {results[model]['STOI'][-1]}, MCD: {results[model]['MCD'][-1]}")
-                # print(f"WER: {results[model]['WER'][-1]}, CER: {results[model]['CER'][-1]}, SIM: {results[model]['SIM'][-1]}")
-
-        for model in estimated_files.keys():
-            for metric in metrics:
-                results[model][metric] = np.mean(results[model][metric])
-
-    else:
-        for i in tqdm(range(len(reference_files))):
-            est_file = librosa.load(estimated_files[i], sr=sr, mono=True)[0]
-            est_wav = librosa.load(est_file, sr=sr, mono=True)[0]
-            est_wav = match_size(ref, est_wav)
-
-            if "SDR" in metrics or "SDRi" in metrics:
-                sdr = get_SDR(est_file, est_wav)
-                if "SDR" in metrics:
-                    results["SDR"].append(sdr)
-                if "SDRi" in metrics:
-                    results["SDRi"].append(sdr - sdr_mix[i])
-            
-            if "SI-SDR" in metrics or "SI-SDRi" in metrics:
-                si_sdr = get_SI_SDR(est_file, est_wav)
-                if "SI-SDR" in metrics:
-                    results["SI-SDR"].append(si_sdr)
-                if "SI-SDRi" in metrics:
-                    results["SI-SDRi"].append(si_sdr - si_sdr_mix[i])
-
-            if "PESQ" in metrics:
-                pesq = get_PESQ(est_file, est_wav, 16000)
-                results["PESQ"].append(pesq)
-
-            if "STOI" in metrics:
-                stoi = get_STOI(est_file, est_wav, 16000)
-                results["STOI"].append(stoi)
-
-            if "MCD" in metrics:
-                mcd = get_MCD(reference_files[i], estimated_files[i])
-                results["MCD"].append(mcd)
-
-            if {"WER", "CER", "SIM"} & metrics:
-                asr_text = normalize_text(transcription_model.transcribe(est_wav, without_timestamps=True, language='en')['text'].strip())
-                if "WER" in metrics:
-                    wer = get_WER(texts[i], asr_text)
-                    results["WER"].append(wer)
-                if "CER" in metrics:
-                    cer = get_CER(texts[i], asr_text)
-                    results["CER"].append(cer)
-                if "SIM" in metrics:
-                    sim = get_SIM(texts[i], asr_text)
-                    results["SIM"].append(sim)
-        
-        for metric in metrics:
-            results[metric] = np.mean(results[metric])
-
     return results

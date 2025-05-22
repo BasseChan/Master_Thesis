@@ -8,46 +8,68 @@ import random
 import json
 from collections import deque
 import shutil
+from scipy.spatial.distance import cosine
 
 
-def prepare_2_mix_dataset(save_location, min_length, max_length, min_overlap, max_overlap, n=1000, sr=16000, seed=42):
+def prepare_2_mix_dataset(save_location, embeddings, min_length, max_length, min_overlap, max_overlap, n=1000, sr=16000, seed=42, dataset=''):
+    if dataset:
+        dataset = f'_{dataset}'
     np.random.seed(seed)
-    df = pd.read_csv('data/metadata.csv')
-    df = df[(df['duration'] >= min_length) & (df['duration'] <= max_length)]
+    rng = np.random.default_rng(seed)
+
+    df_full = pd.read_csv(f'data/metadata{dataset}.csv')
+    df = df_full[(df_full['duration'] >= min_length) & (df_full['duration'] <= max_length)].copy()
+    df = df.reset_index(drop=False)
 
     os.makedirs(save_location, exist_ok=False)
     os.makedirs(os.path.join(save_location, 'mixed'), exist_ok=True)
     os.makedirs(os.path.join(save_location, 'speaker1'), exist_ok=True)
     os.makedirs(os.path.join(save_location, 'speaker2'), exist_ok=True)
 
-    texts = []
+    data = []
     for i in tqdm(range(n)):
-        sample = df.sample(2, random_state=seed)
-        while sample.iloc[0]['speaker'] == sample.iloc[1]['speaker']:
-            sample = df.sample(2)
-        # wczytaj pliki o nazwach z sample
-        wav1 = librosa.load(f'data/voices/{sample.iloc[0]["file"]}.wav', sr=sr)[0]
-        wav2 = librosa.load(f'data/voices/{sample.iloc[1]["file"]}.wav', sr=sr)[0]
+        valid_pair = False
+        while not valid_pair:
+            indices = rng.choice(len(df), size=2, replace=False)
+            s1, s2 = df.iloc[indices[0]], df.iloc[indices[1]]
+            valid_pair = s1['speaker'] != s2['speaker']
+
+        wav1 = librosa.load(f'data/voices/{s1["file"]}.wav', sr=sr)[0]
+        wav2 = librosa.load(f'data/voices/{s2["file"]}.wav', sr=sr)[0]
         wav1 = wav1 / np.max(np.abs(wav1))
         wav2 = wav2 / np.max(np.abs(wav2))
-        # wylosuj długość overlapu
-        overlap_length = min(int(np.random.uniform(min_overlap, max_overlap) * sr), len(wav1), len(wav2))
-        # nałuż próbki z overlapem zadanym przez overlap_length
+
+        overlap_length = min(int(rng.uniform(min_overlap, max_overlap) * sr), len(wav1), len(wav2))
         overlap_sample = np.concatenate((wav1[:-overlap_length], wav1[-overlap_length:] + wav2[:overlap_length], wav2[overlap_length:]))
         overlap_sample = overlap_sample / np.max(np.abs(overlap_sample))
-        # dołącz ciszę po wav1
+
         speaker1 = np.concatenate((wav1, np.zeros(overlap_sample.shape[0] - wav1.shape[0], dtype=np.float32)))
         speaker2 = np.concatenate((np.zeros(overlap_sample.shape[0] - wav2.shape[0], dtype=np.float32), wav2))
 
-        # zapisz do pliku
         write(os.path.join(save_location, f'mixed/{i}.wav'), sr, overlap_sample)
         write(os.path.join(save_location, f'speaker1/{i}.wav'), sr, speaker1)
         write(os.path.join(save_location, f'speaker2/{i}.wav'), sr, speaker2)
 
-        texts.append([sample.iloc[0]['text'], sample.iloc[1]['text']])
+        emb1 = embeddings[s1['index']]
+        emb2 = embeddings[s2['index']]
+        cos_sim = 1 - cosine(emb1, emb2)
 
-    texts_df = pd.DataFrame(texts, columns=['text1', 'text2'])
-    texts_df.to_csv(os.path.join(save_location, f'texts.csv'), index=False)
+        data.append([
+            s1['text'], s2['text'],
+            s1['speaker'], s2['speaker'],
+            s1['duration'], s2['duration'],
+            overlap_sample.shape[0] / sr,
+            cos_sim
+        ])
+
+    texts_df = pd.DataFrame(data, columns=[
+        'text1', 'text2',
+        'speaker1', 'speaker2',
+        'duration1', 'duration2',
+        'duration',
+        'cosine_similarity'
+    ])
+    texts_df.to_csv(os.path.join(save_location, 'texts.csv'), index=False)
 
 
 def smart_shuffle(data):
@@ -87,11 +109,10 @@ def prepare_dialogue_sample(df, overlap_prob=0.7, min_speakers=2, max_speakers=5
                                               min_fragments_per_speaker=1, max_fragments_per_speaker=3,
                                               min_speaker_time=8, min_overlap=1, max_overlap=8,
                                               min_space=0.5, max_space=1.5,
-                                              allow_repeat_speakers=True, sr=16000):
-    # Wybór losowych mówców
+                                              allow_repeat_speakers=True, sr=16000,
+                                              save_format='time'):
     speakers = random.sample(df['speaker'].unique().tolist(), random.randint(min_speakers, max_speakers))
 
-    # Wybór losowych nagrań dla każdego mówcy
     samples = []
     for speaker in speakers:
         files = set()
@@ -116,13 +137,13 @@ def prepare_dialogue_sample(df, overlap_prob=0.7, min_speakers=2, max_speakers=5
 
     connected_wav = librosa.load(f'data/voices/{samples[0]["file"]}.wav', sr=sr)[0]
     overlap = []
-    data = [[samples[0]["file"], samples[0]['speaker'], samples[0]['text'], 0, connected_wav.shape[0] / sr]]
+    data = [[samples[0]["file"], samples[0]['speaker'], samples[0]['text'], 0, connected_wav.shape[0] / sr]] if save_format == 'time' \
+        else [[samples[0]["file"], samples[0]['speaker'], samples[0]['text'], 0, connected_wav.shape[0]]]
     prev_speaker = samples[0]['speaker']
     prev_fragment_end = 0
     for i in range(1, len(samples)):
         wav = librosa.load(f'data/voices/{samples[i]["file"]}.wav', sr=sr)[0]
 
-        # losuj odstęp od poprzedniego fragmentu
         if samples[i]['speaker'] == prev_speaker:
             connection_time = random.randint(int(min_space * sr), int(max_space * sr))
         else:
@@ -135,46 +156,54 @@ def prepare_dialogue_sample(df, overlap_prob=0.7, min_speakers=2, max_speakers=5
                 else:
                     connection_time = -random.randint(int(min_overlap * sr), max_delay)
 
-        # połącz fragment
         if connection_time > 0: # brak overlapa
             prev_fragment_end = connected_wav.shape[0]
             connected_wav = np.concatenate((connected_wav, np.zeros(connection_time, dtype=np.float32), wav))
             prev_speaker = samples[i]['speaker']
-            data.append([samples[i]["file"], samples[i]['speaker'], samples[i]['text'], (connected_wav.shape[0] - wav.shape[0]) / sr, connected_wav.shape[0] / sr])
+            data.append([samples[i]["file"], samples[i]['speaker'], samples[i]['text'], (connected_wav.shape[0] - wav.shape[0]) / sr, connected_wav.shape[0] / sr] \
+                        if save_format == 'time' \
+                        else [samples[i]["file"], samples[i]['speaker'], samples[i]['text'], connected_wav.shape[0] - wav.shape[0], connected_wav.shape[0]])
         else: # overlap
             connection_time = -connection_time
-            if wav.shape[0] <= connection_time:
+            if wav.shape[0] < connection_time:
                 connected_wav[-connection_time : -connection_time + wav.shape[0]] += wav
                 end = connected_wav.shape[0] - connection_time + wav.shape[0]
-                overlap.append([(connected_wav.shape[0] - connection_time) / sr, end / sr])
-                data.append([samples[i]["file"], samples[i]['speaker'], samples[i]['text'], (connected_wav.shape[0] - connection_time) / sr, end / sr])
-                # if end > prev_fragment_end:
+                overlap.append([(connected_wav.shape[0] - connection_time) / sr, end / sr] \
+                        if save_format == 'time' \
+                        else [connected_wav.shape[0] - connection_time, end])
+                data.append([samples[i]["file"], samples[i]['speaker'], samples[i]['text'], (connected_wav.shape[0] - connection_time) / sr, end / sr] \
+                        if save_format == 'time' \
+                        else [samples[i]["file"], samples[i]['speaker'], samples[i]['text'], connected_wav.shape[0] - connection_time, end])
                 prev_fragment_end = end
-                # organized_fragments.append([samples[i]['file'], samples[i]['text'], samples[i]['speaker'], end - wav.shape[0], end])
             else:
                 prev_fragment_end = connected_wav.shape[0]
                 connected_wav[-connection_time:] += wav[:connection_time]
-                overlap.append([(connected_wav.shape[0] - connection_time) / sr, connected_wav.shape[0] / sr])
+                overlap.append([(connected_wav.shape[0] - connection_time) / sr, connected_wav.shape[0] / sr] \
+                        if save_format == 'time' \
+                        else [connected_wav.shape[0] - connection_time, connected_wav.shape[0]])
                 connected_wav = np.concatenate((connected_wav, wav[connection_time:]))
                 prev_speaker = samples[i]['speaker']
-                data.append([samples[i]["file"], samples[i]['speaker'], samples[i]['text'], (connected_wav.shape[0] - wav.shape[0]) / sr, connected_wav.shape[0] / sr])
-                # organized_fragments.append([samples[i]['file'], samples[i]['text'], samples[i]['speaker'], connected_wav.shape[0] - wav.shape[0], connected_wav.shape[0]])
+                data.append([samples[i]["file"], samples[i]['speaker'], samples[i]['text'], (connected_wav.shape[0] - wav.shape[0]) / sr, connected_wav.shape[0] / sr] \
+                        if save_format == 'time' \
+                        else [samples[i]["file"], samples[i]['speaker'], samples[i]['text'], connected_wav.shape[0] - wav.shape[0], connected_wav.shape[0]])
     connected_wav = connected_wav / np.max(np.abs(connected_wav))
     return connected_wav, data, overlap
 
 
-def prepare_dialogue_dataset(n, save_dir, overlap_prob=0.7, min_speakers=2, max_speakers=5,
+def prepare_dialogue_dataset(n, save_dir, metadata_path, overlap_prob=0.7, min_speakers=2, max_speakers=5,
                                               min_fragments_per_speaker=1, max_fragments_per_speaker=3,
                                               min_speaker_time=8, min_overlap=1, max_overlap=8,
                                               min_space=0.5, max_space=1.5,
-                                              allow_repeat_speakers=True, sr=16000, seed=42):
+                                              allow_repeat_speakers=True, sr=16000, seed=42,
+                                              min_fragment_duration=1, max_fragment_duration=10, min_speaker_reception_time=30,
+                                              save_format='time'):
     np.random.seed(seed)
     random.seed(seed)
 
-    df = pd.read_csv('data/metadata.csv')
-    df_filterd = df[(df['duration'] >= 1) & (df['duration'] <= 10)]
+    df = pd.read_csv(metadata_path)
+    df_filterd = df[(df['duration'] >= min_fragment_duration) & (df['duration'] <= max_fragment_duration)]
     speakers = df_filterd.groupby('speaker')['duration'].sum()
-    speakers = speakers[speakers >= 30]
+    speakers = speakers[speakers >= min_speaker_reception_time]
     df_filterd = df_filterd[df_filterd['speaker'].isin(speakers.index)]
 
     if os.path.exists(save_dir):
@@ -190,8 +219,8 @@ def prepare_dialogue_dataset(n, save_dir, overlap_prob=0.7, min_speakers=2, max_
                                                         min_fragments_per_speaker, max_fragments_per_speaker,
                                                         min_speaker_time, min_overlap, max_overlap,
                                                         min_space, max_space,
-                                                        allow_repeat_speakers, sr)
-        total_time += connected_wav.shape[0] / sr
+                                                        allow_repeat_speakers, sr, save_format)
+        total_time += connected_wav.shape[0]
         for j in range(len(overlap)):
             overlaps.append([i, *overlap[j]])
             overlap_time += overlap[j][-1] - overlap[j][-2]
@@ -203,3 +232,4 @@ def prepare_dialogue_dataset(n, save_dir, overlap_prob=0.7, min_speakers=2, max_
     fragments = pd.DataFrame(fragments, columns=['sample_id', 'file', 'speaker', 'text', 'start', 'end'])
     fragments.to_csv(f'{save_dir}/fragments.csv', index=False)
     print('Overlap time:', overlap_time / total_time * 100, '%')
+    print('Średnia długość nagrań:', total_time/n/sr)
