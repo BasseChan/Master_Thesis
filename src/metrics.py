@@ -53,8 +53,14 @@ def get_MSS(reference, estimated):
     S_ref = np.abs(librosa.stft(reference, n_fft=1024, hop_length=512))
     S_gen = np.abs(librosa.stft(estimated, n_fft=1024, hop_length=512))
 
-    S_max = np.maximum(S_ref, S_gen)
-    return (sum(sum(S_ref)) + sum(sum(S_gen))) / sum(sum(S_max)) - 1
+    S_ref_db = librosa.amplitude_to_db(S_ref, ref=np.max) + np.finfo(S_ref.dtype).eps
+    S_gen_db = librosa.amplitude_to_db(S_gen, ref=np.max) + np.finfo(S_ref.dtype).eps
+
+    S_ref_db = np.clip(S_ref_db, -80, 0) + 80
+    S_gen_db = np.clip(S_gen_db, -80, 0) + 80
+
+    S_max = np.maximum(S_ref_db, S_gen_db)
+    return (np.sum(S_ref_db) + np.sum(S_gen_db)) / np.sum(S_max) - 1
 
 
 def get_SI_MSS(reference, estimated):
@@ -63,6 +69,21 @@ def get_SI_MSS(reference, estimated):
     reference = reference * a
 
     return get_MSS(reference, estimated)
+
+def get_MES(reference, estimated):
+    E_ref = reference ** 2 + np.finfo(reference.dtype).eps
+    E_gen = estimated ** 2 + np.finfo(reference.dtype).eps
+
+    E_max = np.maximum(E_ref, E_gen)
+    return (np.sum(E_ref) + np.sum(E_gen)) / np.sum(E_max) - 1
+
+
+def get_SI_MES(reference, estimated):
+    eps = np.finfo(reference.dtype).eps
+    a = np.dot(estimated.T, reference) / (np.dot(reference.T, reference) + eps)
+    reference = reference * a
+
+    return get_MES(reference, estimated)
 
 
 def normalize_text(text):
@@ -98,7 +119,7 @@ def match_size(ref_wav, gen_wav):
 
 def calculate_single_file_metrics(reference_file: str, estimated_file: str | dict[str],
                       mixed_file: str, sr: int = 16000, text: str = None,
-                      metrics: set[Literal["SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "MSS", "SI-MSS"]] = None,
+                      metrics: set[Literal["SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "SI-MES", "SI-MSS"]] = None,
                       transcription_model = None) -> dict[str, float] | dict[str, dict[str, float]]:
     """
     Calculate metrics for one reference and estimated file.
@@ -108,7 +129,7 @@ def calculate_single_file_metrics(reference_file: str, estimated_file: str | dic
         estimated_file (str | dict[str]): Path to the estimated audio file or a dictionary with keys as labels and values as paths.
         mixed_file (str): Path to the mixed audio file.
         sr (int): Sample rate for loading audio files.
-        metrics (set[Literal["SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "MSS", "SI-MSS"]], optional): Set of metrics to calculate. Defaults to None, which calculates all metrics.
+        metrics (set[Literal["SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "SI-MES", "SI-MSS"]], optional): Set of metrics to calculate. Defaults to None, which calculates all metrics.
         transcription_model: Transcription model for WER, CER, SIM metrics.
 
     Returns:
@@ -116,9 +137,9 @@ def calculate_single_file_metrics(reference_file: str, estimated_file: str | dic
     """
 
     if metrics is None:
-        metrics = {"SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "WER", "CER", "SIM", "MSS", "SI-MSS"}
+        metrics = {"SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "WER", "CER", "SIM", "SI-MES", "SI-MSS"}
     else:
-        metrics = metrics & {"SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "WER", "CER", "SIM", "MSS", "SI-MSS"}
+        metrics = metrics & {"SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "WER", "CER", "SIM", "SI-MES", "SI-MSS"}
 
     ref = librosa.load(reference_file, sr=sr, mono=True)[0]
     if sr != 16000: ref = librosa.resample(ref, orig_sr=sr, target_sr=16000)
@@ -176,9 +197,9 @@ def calculate_single_file_metrics(reference_file: str, estimated_file: str | dic
                 sim = get_SIM(text, asr_text)
                 results["SIM"] = sim
         
-        if "MSS" in metrics:
-            mss = get_MSS(ref, est)
-            results["MSS"] = mss
+        if "SI-MES" in metrics:
+            mss = get_SI_MES(ref, est)
+            results["SI-MES"] = mss
 
         if "SI-MSS" in metrics:
             si_mss = get_SI_MSS(ref, est)
@@ -206,7 +227,7 @@ def calculate_single_file_metrics(reference_file: str, estimated_file: str | dic
 
 def calculate_metrics(reference_files: list[str], estimated_files: list[str] | list[dict[str]],
                       mixed_files: list[str], sr: int = 16000, texts: list[str] = None,
-                      metrics: set[Literal["SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "MSS", "SI-MSS"]] = None,
+                      metrics: set[Literal["SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "SI-MES", "SI-MSS"]] = None,
                       transcription_model = None) -> list[dict[str, float]] | list[dict[str, dict[str, float]]]:
     """
     Calculate metrics for a list of reference and estimated files.
@@ -222,9 +243,9 @@ def calculate_metrics(reference_files: list[str], estimated_files: list[str] | l
     """
 
     if metrics is None:
-        metrics = {"SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "WER", "CER", "SIM", "MSS", "SI-MSS"}
+        metrics = {"SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "WER", "CER", "SIM", "SI-MES", "SI-MSS"}
     else:
-        metrics = metrics & {"SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "WER", "CER", "SIM", "MSS", "SI-MSS"}
+        metrics = metrics & {"SDR", "SDRi", "SI-SDR", "SI-SDRi", "PESQ", "STOI", "MCD", "WER", "CER", "SIM", "SI-MES", "SI-MSS"}
 
     results = [calculate_single_file_metrics(ref_file, est_file, mix_file, sr, text, metrics, transcription_model)
                for ref_file, est_file, mix_file, text in tqdm(list(zip(reference_files, estimated_files, mixed_files, texts)))]
